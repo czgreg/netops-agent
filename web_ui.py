@@ -545,7 +545,12 @@ class Handler(BaseHTTPRequestHandler):
         agent = AGENTS.get(sid)
         if agent is None:
             if not DEFAULT_API_KEY:
-                required = "ZHIPU_API_KEY" if DEFAULT_PROVIDER == "zhipu" else "OPENAI_API_KEY"
+                if DEFAULT_PROVIDER == "zhipu":
+                    required = "ZHIPU_API_KEY"
+                elif DEFAULT_PROVIDER == "ppio":
+                    required = "PPIO_API_KEY"
+                else:
+                    required = "OPENAI_API_KEY"
                 self._send_json(400, {"error": f".env 未配置 {required}"}, sid)
                 return
             if not API_KEY_STATUS.get("usable"):
@@ -633,17 +638,20 @@ def main() -> None:
     load_dotenv()
     DEFAULT_PROVIDER = os.getenv("AI_PROVIDER", "zhipu").strip().lower() or "zhipu"
     DEFAULT_BASE_URL = os.getenv("AI_BASE_URL", "").strip() or (
-        "https://open.bigmodel.cn/api/paas/v4/" if DEFAULT_PROVIDER == "zhipu" else ""
+        "https://open.bigmodel.cn/api/paas/v4/"
+        if DEFAULT_PROVIDER == "zhipu"
+        else ("https://api.ppio.com/openai" if DEFAULT_PROVIDER == "ppio" else "")
     )
     DEFAULT_TEXT_MODEL = os.getenv("AI_TEXT_MODEL", "").strip() or os.getenv("AI_MODEL", "").strip() or "glm-4.7"
     DEFAULT_VISION_MODEL = os.getenv("AI_VISION_MODEL", "").strip() or "glm-4.6v"
     DEFAULT_VISION_FALLBACK_MODEL = os.getenv("AI_VISION_FALLBACK_MODEL", "").strip()
     AUTO_SELECT_TEXT_MODEL = os.getenv("AUTO_SELECT_TEXT_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
-    DEFAULT_API_KEY = (
-        os.getenv("ZHIPU_API_KEY", "").strip()
-        if DEFAULT_PROVIDER == "zhipu"
-        else os.getenv("OPENAI_API_KEY", "").strip()
-    )
+    if DEFAULT_PROVIDER == "zhipu":
+        DEFAULT_API_KEY = os.getenv("ZHIPU_API_KEY", "").strip()
+    elif DEFAULT_PROVIDER == "ppio":
+        DEFAULT_API_KEY = os.getenv("PPIO_API_KEY", "").strip()
+    else:
+        DEFAULT_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
     probe_default_api_key()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Web UI 启动: http://{HOST}:{PORT}")

@@ -492,6 +492,8 @@ class NetOpsAgent:
     def _default_base_url(self, provider: str) -> Optional[str]:
         if provider == "zhipu":
             return "https://open.bigmodel.cn/api/paas/v4/"
+        if provider == "ppio":
+            return "https://api.ppio.com/openai"
         return None
 
     def _resolve_model(self, model: Optional[str], auto_select_model: bool) -> ModelInfo:
