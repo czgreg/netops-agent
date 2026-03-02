@@ -9,7 +9,7 @@ import time
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict
+from typing import Any, Dict
 import urllib.error
 import urllib.request
 
@@ -27,9 +27,12 @@ TOPOLOGY_CONTEXTS: Dict[str, str] = {}
 VISION_PROMPTS: Dict[str, str] = {}
 TRACE_STATES: Dict[str, dict] = {}
 TRACE_LOCK = threading.Lock()
-DEFAULT_API_KEY = ""
-DEFAULT_PROVIDER = "zhipu"
-DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+DEFAULT_TEXT_API_KEY = ""
+DEFAULT_TEXT_PROVIDER = "zhipu"
+DEFAULT_TEXT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+DEFAULT_VISION_API_KEY = ""
+DEFAULT_VISION_PROVIDER = "ppio"
+DEFAULT_VISION_BASE_URL = "https://api.ppio.com/openai"
 DEFAULT_TEXT_MODEL = "glm-4.7"
 DEFAULT_VISION_MODEL = "glm-4.6v"
 DEFAULT_VISION_FALLBACK_MODEL = ""
@@ -40,6 +43,8 @@ API_KEY_STATUS = {
     "usable": False,
     "message": "未检测",
     "provider": "",
+    "text_provider": "",
+    "vision_provider": "",
     "text_model": "",
     "text_source": "",
     "vision_model": "",
@@ -49,12 +54,16 @@ API_KEY_STATUS = {
 }
 
 DEFAULT_VISION_PROMPT_TEXT = (
-    "请根据图片输出一段拓扑结构描述（纯文本，不要JSON、不要代码块）。\n"
+    "请分析这张网络拓扑图，并用简洁中文输出：\n"
+    "\n"
+    "1. 列出识别到的设备类型与名称（如核心交换机、接入交换机、防火墙、路由器、服务器等）。\n"
+    "2. 描述设备之间的连接关系。\n"
+    "3. 无法识别的信息标注“未识别”。\n"
+    "\n"
     "要求：\n"
-    "1) 先描述核心拓扑结构和关键互联路径；\n"
-    "2) 再补充设备角色、网段和区域；\n"
-    "3) 尽可能完整但简洁，控制在8~14行；\n"
-    "4) 不确定处标注“未识别”。"
+    "- 仅输出纯文本\n"
+    "- 控制在 6–10 行\n"
+    "- 不要使用 JSON、表格或代码块"
 )
 
 
@@ -65,33 +74,50 @@ HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NetOps Agent</title>
   <style>
+    *, *::before, *::after{box-sizing:border-box;}
     body{font-family:ui-sans-serif,system-ui,-apple-system;background:#f8fafc;color:#0f172a;max-width:1200px;margin:20px auto;padding:0 12px;}
-    h2{margin:0 0 12px 0;}
+    h2{margin:0;font-size:20px;}
     .header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;}
-    .layout{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;height:calc(100vh - 110px);}
-    .card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px;min-height:0;height:100%;display:flex;flex-direction:column;}
+    .header-right{display:flex;align-items:center;gap:10px;min-width:0;}
+    .header-status{display:flex;flex-direction:column;align-items:flex-end;min-width:0;}
+    .header-top{display:flex;align-items:center;gap:8px;}
+    .header-btn{padding:4px 10px;font-size:12px;border-radius:999px;background:#dcfce7;border:1px solid #bbf7d0;color:#166534;line-height:1;height:26px;}
+    .layout{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;height:calc(100vh - 110px);min-width:0;}
+    .layout > *{min-width:0;}
+    .card{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px;min-height:0;height:100%;display:flex;flex-direction:column;min-width:0;overflow:hidden;}
     .card h3{margin:0 0 10px 0;font-size:16px;}
-    .row{display:flex;gap:8px;margin:8px 0;}
-    textarea,input{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;}
+    .row{display:flex;gap:8px;margin:8px 0;min-width:0;}
+    textarea,input{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;min-width:0;}
     button{padding:10px 14px;cursor:pointer;border:1px solid #cbd5e1;background:#fff;border-radius:8px;}
     .primary{background:#0f172a;color:#fff;border-color:#0f172a;}
-    pre{white-space:pre-wrap;background:#0b1220;color:#e2e8f0;padding:12px;border-radius:8px;min-height:0;max-height:none;overflow:auto;flex:1;}
+    pre{white-space:pre-wrap;background:#0b1220;color:#e2e8f0;padding:12px;border-radius:8px;min-height:0;max-height:none;overflow:auto;flex:1;min-width:0;overflow-wrap:anywhere;word-break:break-word;}
     small{color:#475569;}
     .badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;}
     .ok{background:#dcfce7;color:#166534;}
     .bad{background:#fee2e2;color:#991b1b;}
     .warn{background:#fef3c7;color:#92400e;}
-    .img-wrap{border:1px dashed #cbd5e1;border-radius:8px;min-height:220px;display:flex;align-items:center;justify-content:center;background:#f8fafc;overflow:hidden;}
+    .img-wrap{border:1px dashed #cbd5e1;border-radius:8px;min-height:220px;display:flex;align-items:center;justify-content:center;background:#f8fafc;overflow:hidden;min-width:0;}
     .img-wrap img{width:100%;height:auto;display:block;}
     .kv{font-size:13px;line-height:1.6;color:#334155;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px;}
-    .topo-json{width:100%;min-height:180px;max-height:240px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;}
-    .chat-box{display:flex;flex-direction:column;gap:10px;height:100%;}
-    .chat-messages{flex:1;min-height:0;max-height:none;overflow:auto;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px;}
-    .msg{max-width:86%;padding:8px 10px;border-radius:10px;margin:8px 0;white-space:pre-wrap;line-height:1.5;}
+    .topo-card{overflow:auto;}
+    .topo-json{width:100%;min-height:0;max-height:180px;height:180px;resize:none;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;overflow:auto;}
+    .chat-box{display:flex;flex-direction:column;gap:10px;height:100%;min-width:0;}
+    .chat-messages{flex:1;min-height:0;max-height:none;overflow:auto;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px;min-width:0;}
+    .msg{max-width:86%;padding:8px 10px;border-radius:10px;margin:8px 0;white-space:pre-wrap;line-height:1.5;overflow-wrap:anywhere;word-break:break-word;}
     .msg-user{margin-left:auto;background:#dbeafe;color:#1e3a8a;}
     .msg-assistant{margin-right:auto;background:#ecfeff;color:#134e4a;}
     .msg-status{margin:8px auto;background:#e2e8f0;color:#334155;font-size:12px;}
     .chat-input{width:100%;min-height:86px;max-height:140px;resize:vertical;}
+    .modal-mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;z-index:2000;padding:16px;}
+    .modal{width:min(720px,96vw);background:#fff;border:1px solid #cbd5e1;border-radius:12px;padding:12px;box-shadow:0 20px 50px rgba(2,6,23,.25);}
+    .modal-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;}
+    .modal-title{font-size:16px;font-weight:600;}
+    .modal textarea{width:100%;height:300px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;}
+    .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px;}
+    .tab-btn{padding:8px 10px;font-size:12px;}
+    .tab-btn.active{background:#0f172a;color:#fff;border-color:#0f172a;}
+    .tab-pane{display:none;flex:1;min-height:0;min-width:0;overflow:hidden;}
+    .tab-pane.active{display:flex;flex-direction:column;gap:8px;}
     @media (max-width: 1080px){
       .layout{grid-template-columns:1fr;}
       .card{min-height:420px;}
@@ -100,58 +126,90 @@ HTML = """<!doctype html>
 </head>
 <body>
   <div class="header">
-    <h2>NetOps AI 助手</h2>
-    <div>
-      <div id="keyStatus" class="badge __KEY_STATUS_CLASS__">__KEY_STATUS_TEXT__</div>
-      <div id="modelInfo" style="font-size:12px;color:#475569;margin-top:6px;">__MODEL_INFO_TEXT__</div>
+    <div><h2>NetOps Agent</h2></div>
+    <div class="header-right">
+      <div class="header-status">
+        <div class="header-top">
+          <div id="keyStatus" class="badge __KEY_STATUS_CLASS__">__KEY_STATUS_TEXT__</div>
+          <button class="header-btn" onclick="refreshStatus()">刷新 Key 状态</button>
+        </div>
+        <div id="modelInfo" style="font-size:12px;color:#475569;margin-top:6px;">__MODEL_INFO_TEXT__</div>
+      </div>
     </div>
   </div>
 
   <div class="layout">
-    <section class="card">
-      <h3>拓扑 URL 与信息</h3>
-      <div class="row"><input id="imgUrl" type="text" placeholder="输入可公网访问的拓扑图片 URL（必填）" /></div>
+    <section class="card topo-card">
+      <h3>拓扑与上下文</h3>
+      <div class="row"><input id="imgUrl" type="text" placeholder="粘贴可公网访问的拓扑图片 URL" /></div>
       <div class="img-wrap"><img id="imgPreview" alt="topology preview" style="display:none;" /></div>
       <div class="row">
-        <button onclick="clearImage()">清空图片</button>
-        <button onclick="extractTopology()">解析拓扑</button>
+        <button onclick="clearImage()">删除拓扑</button>
+        <button onclick="extractTopology()">分析拓扑</button>
+        <button id="promptToggleBtn" onclick="openPromptModal()">解析提示词</button>
       </div>
-      <div id="imgMeta" class="kv">未设置拓扑图片 URL</div>
-      <div class="row">
-        <textarea id="visionPrompt" class="topo-json" placeholder="可编辑视觉解析提示词"></textarea>
-      </div>
+      <div id="imgMeta" class="kv">尚未导入拓扑。支持粘贴 URL 进行分析。</div>
       <div class="row">
         <textarea id="topologyJson" class="topo-json" placeholder="拓扑结构描述（可编辑确认）"></textarea>
       </div>
-      <small>仅支持公网可访问 URL（例如对象存储、CDN 或图床链接）。</small>
     </section>
 
     <section class="card">
       <h3>对话输入与输出</h3>
       <div class="chat-box">
         <div id="chatMessages" class="chat-messages">
-          <div class="msg msg-status">欢迎使用 NetOps AI 助手</div>
+          <div class="msg msg-status">开始对话</div>
         </div>
         <textarea id="q" class="chat-input" placeholder="请输入问题，例如：10.0.0.11 到 10.0.2.20 不通"></textarea>
         <div class="row">
           <button id="sendBtn" class="primary" onclick="ask()">发送</button>
           <button onclick="clearLog()">清空对话</button>
-          <button onclick="refreshStatus()">刷新 Key 状态</button>
         </div>
       </div>
-      <small>连接信息通过对话获取：host/protocol/username/password/device_type。</small>
     </section>
 
     <section class="card">
-      <h3>设备交互细节</h3>
-      <pre id="details">暂无交互细节</pre>
-      <small>显示本轮调用的工具、参数（已脱敏）与返回摘要。</small>
+      <h3>Ops Panel</h3>
+      <div class="row">
+        <button id="tabTrace" class="tab-btn active" onclick="switchRightTab('trace')">Trace</button>
+        <button id="tabLog" class="tab-btn" onclick="switchRightTab('log')">Log</button>
+        <button id="tabCmd" class="tab-btn" onclick="switchRightTab('cmd')">Commands</button>
+        <button id="tabReport" class="tab-btn" onclick="switchRightTab('report')">Report</button>
+      </div>
+      <div id="paneTrace" class="tab-pane active">
+        <pre id="tracePreview">暂无思路轨迹</pre>
+      </div>
+      <div id="paneLog" class="tab-pane">
+        <pre id="logDetails">暂无交互日志</pre>
+      </div>
+      <div id="paneCmd" class="tab-pane">
+        <pre id="cmdPreview">暂无命令建议</pre>
+        <div class="row"><button onclick="copyCommands()">复制命令</button></div>
+      </div>
+      <div id="paneReport" class="tab-pane">
+        <pre id="reportPreview">暂无报告</pre>
+      </div>
     </section>
+  </div>
+
+  <div id="promptModalMask" class="modal-mask" onclick="closePromptModal(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-head">
+        <div class="modal-title">拓扑解析提示词</div>
+        <button onclick="closePromptModal()">关闭</button>
+      </div>
+      <textarea id="visionPrompt" placeholder="可编辑视觉解析提示词"></textarea>
+      <div class="modal-actions">
+        <button onclick="resetPromptDefault()">恢复默认</button>
+        <button class="primary" onclick="savePrompt()">保存</button>
+      </div>
+    </div>
   </div>
 
   <script>
     const chatMessages = document.getElementById('chatMessages');
-    const details = document.getElementById('details');
+    const tracePreview = document.getElementById('tracePreview');
+    const logDetails = document.getElementById('logDetails');
     const keyStatus = document.getElementById('keyStatus');
     const modelInfo = document.getElementById('modelInfo');
     const imgUrlInput = document.getElementById('imgUrl');
@@ -160,13 +218,32 @@ HTML = """<!doctype html>
     const visionPrompt = document.getElementById('visionPrompt');
     const topologyJson = document.getElementById('topologyJson');
     const sendBtn = document.getElementById('sendBtn');
-    let traceTimer = null;
-    visionPrompt.value = `请根据图片输出一段拓扑结构描述（纯文本，不要JSON、不要代码块）。
+    const promptModalMask = document.getElementById('promptModalMask');
+    const promptToggleBtn = document.getElementById('promptToggleBtn');
+    const cmdPreview = document.getElementById('cmdPreview');
+    const reportPreview = document.getElementById('reportPreview');
+    const tabTrace = document.getElementById('tabTrace');
+    const tabLog = document.getElementById('tabLog');
+    const tabCmd = document.getElementById('tabCmd');
+    const tabReport = document.getElementById('tabReport');
+    const paneTrace = document.getElementById('paneTrace');
+    const paneLog = document.getElementById('paneLog');
+    const paneCmd = document.getElementById('paneCmd');
+    const paneReport = document.getElementById('paneReport');
+    const DEFAULT_PROMPT = `请分析这张网络拓扑图，并用简洁中文输出：
+
+1. 列出识别到的设备类型与名称（如核心交换机、接入交换机、防火墙、路由器、服务器等）。
+2. 描述设备之间的连接关系。
+3. 无法识别的信息标注“未识别”。
+
 要求：
-1) 先描述核心拓扑结构和关键互联路径；
-2) 再补充设备角色、网段和区域；
-3) 尽可能完整但简洁，控制在8~14行；
-4) 不确定处标注“未识别”。`;
+- 仅输出纯文本
+- 控制在 6–10 行
+- 不要使用 JSON、表格或代码块`;
+    let traceTimer = null;
+    let latestTrace = null;
+    let latestAnswer = "";
+    visionPrompt.value = localStorage.getItem('netops_vision_prompt') || DEFAULT_PROMPT;
     function addMsg(role, text){
       const el = document.createElement('div');
       el.className = 'msg ' + (role === 'user' ? 'msg-user' : role === 'assistant' ? 'msg-assistant' : 'msg-status');
@@ -175,11 +252,30 @@ HTML = """<!doctype html>
       chatMessages.scrollTop = chatMessages.scrollHeight;
     }
     function clearLog(){
-      chatMessages.innerHTML = '<div class="msg msg-status">欢迎使用 NetOps AI 助手</div>';
+      chatMessages.innerHTML = '<div class="msg msg-status">开始对话</div>';
+    }
+    function openPromptModal(){
+      if(!promptModalMask){ return; }
+      promptModalMask.style.display = 'flex';
+    }
+    function closePromptModal(evt){
+      if(evt && evt.target && evt.target !== promptModalMask){ return; }
+      if(!promptModalMask){ return; }
+      promptModalMask.style.display = 'none';
+    }
+    function savePrompt(){
+      const v = (visionPrompt.value || "").trim();
+      localStorage.setItem('netops_vision_prompt', v || DEFAULT_PROMPT);
+      visionPrompt.value = v || DEFAULT_PROMPT;
+      closePromptModal();
+      addMsg('status', "解析提示词已保存。");
+    }
+    function resetPromptDefault(){
+      visionPrompt.value = DEFAULT_PROMPT;
     }
     function clearImage(){
       imgUrlInput.value = "";
-      imgMeta.textContent = "未设置拓扑图片 URL";
+      imgMeta.textContent = "尚未导入拓扑。支持粘贴 URL 进行分析。";
       imgPreview.style.display = "none";
       imgPreview.src = "";
       topologyJson.value = "";
@@ -190,7 +286,7 @@ HTML = """<!doctype html>
         clearImage();
         return;
       }
-      imgMeta.textContent = "URL: " + url;
+      imgMeta.textContent = "已导入拓扑 URL: " + url;
       imgPreview.src = url;
       imgPreview.style.display = "block";
     });
@@ -207,14 +303,13 @@ HTML = """<!doctype html>
         keyStatus.className = "badge bad";
         keyStatus.textContent = "API Key 不可用: " + (data.message || "未知错误");
       }
-      const provider = data.provider || "unknown";
+      const textProvider = data.text_provider || "unknown";
+      const visionProvider = data.vision_provider || "unknown";
       const textModel = data.text_model || "unknown";
       const textSource = data.text_source || "unknown";
       const visionModel = data.vision_model || "unknown";
-      const fallbackModel = data.vision_fallback_model || "none";
       const visionState = data.vision_usable ? "可用" : "不可用";
-      const imgCap = data.supports_image ? "是" : "否";
-      modelInfo.textContent = "Provider: " + provider + " | 文本模型: " + textModel + " (" + textSource + ") | 视觉模型: " + visionModel + " | 回退模型: " + fallbackModel + " | 视觉状态: " + visionState + " | 图片支持: " + imgCap;
+      modelInfo.textContent = "🟢 文本(" + textProvider + "): " + textModel + " (" + textSource + ") | 视觉(" + visionProvider + "): " + visionModel + " (" + visionState + ")";
     }
     function withTimeout(promise, ms){
       return Promise.race([
@@ -242,7 +337,8 @@ HTML = """<!doctype html>
       if(sendBtn){ sendBtn.disabled = true; sendBtn.textContent = "处理中..."; }
       addMsg('user', q);
       addMsg('status', "正在排查...（阶段 1/4：解析问题）");
-      details.textContent = "执行轨迹\\n\\n- 阶段 1/4: 解析问题\\n- 阶段 2/4: 准备连接与检查项\\n- 阶段 3/4: 调用设备工具\\n- 阶段 4/4: 汇总结论\\n\\n当前状态: 请求已发送，等待 Agent 返回...";
+      tracePreview.textContent = "AI 思路轨迹\\n\\n- 思路: 解析用户问题并定位源/目的\\n- 计划: 先最小检查，再逐步扩展\\n- 执行: 等待首个工具调用\\n- 结果: 进行中";
+      logDetails.textContent = "执行日志\\n\\n请求已发送，等待 Agent 返回...";
       const topo = topologyJson.value.trim();
       const imageRef = imgUrlInput.value.trim();
       const vp = visionPrompt.value.trim();
@@ -264,15 +360,7 @@ HTML = """<!doctype html>
           return;
         }
         addMsg('assistant', data.answer || "排障完成，但返回为空。");
-        if(data.trace){
-          details.textContent = renderTrace(data.trace);
-          details.scrollTop = details.scrollHeight;
-        }else if(data.tool_calls && data.tool_calls.length){
-          details.textContent = JSON.stringify(data.tool_calls, null, 2);
-          details.scrollTop = details.scrollHeight;
-        }else{
-          details.textContent = "本轮未产生工具调用。";
-        }
+        updateOpsPanels(data);
       }catch(err){
         addMsg('assistant', "请求异常: " + String(err && err.message ? err.message : err));
       }finally{
@@ -289,8 +377,7 @@ HTML = """<!doctype html>
           if(!resp.ok){ return; }
           const data = await resp.json();
           if(!data){ return; }
-          details.textContent = renderTrace(data);
-          details.scrollTop = details.scrollHeight;
+          updateOpsPanels({trace: data});
           if(data.status === "completed" || data.status === "failed"){
             stopTracePolling();
           }
@@ -305,7 +392,7 @@ HTML = """<!doctype html>
         traceTimer = null;
       }
     }
-    function renderTrace(trace){
+    function renderLog(trace){
       const logic = (trace.logic || []).map((x, i) => (i + 1) + ". " + x).join("\\n");
       const p = trace.progress || {};
       const actions = (trace.actions || []).map((a) => {
@@ -327,6 +414,365 @@ HTML = """<!doctype html>
         + "- 失败: " + ((p.failed_actions === undefined || p.failed_actions === null) ? 0 : p.failed_actions) + "\\n"
         + "- 完成度: " + ((p.completion === undefined || p.completion === null) ? 0 : p.completion) + "%\\n\\n"
         + "行动明细:\\n" + (actions || "本轮未产生工具调用。");
+    }
+    function renderThinkingTrace(trace){
+      const p = trace.progress || {};
+      const logic = Array.isArray(trace.logic) ? trace.logic : [];
+      const actions = Array.isArray(trace.actions) ? trace.actions : [];
+      const lines = [];
+      lines.push("Trace");
+      lines.push("");
+      lines.push("Task");
+      lines.push("- " + (trace.question || "未识别任务"));
+      lines.push("");
+      lines.push("Plan");
+      const planLines = logic.slice(0, 5);
+      if(planLines.length === 0){
+        lines.push("- 解析问题 -> 最小必要检查 -> 收敛故障点");
+      }else{
+        planLines.forEach((x, i) => lines.push((i + 1) + ". " + x));
+      }
+      lines.push("");
+      lines.push("Progress");
+      lines.push("- 状态: " + (trace.status || "running"));
+      lines.push("- 阶段: " + (trace.stage || "处理中"));
+      lines.push("- 总步骤: " + ((p.total_actions === undefined || p.total_actions === null) ? 0 : p.total_actions));
+      lines.push("- 已完成: " + ((p.success_actions === undefined || p.success_actions === null) ? 0 : p.success_actions));
+      lines.push("- 失败: " + ((p.failed_actions === undefined || p.failed_actions === null) ? 0 : p.failed_actions));
+      lines.push("- 完成率: " + ((p.completion === undefined || p.completion === null) ? 0 : p.completion) + "%");
+      lines.push("");
+      if(actions.length === 0){
+        lines.push("Execution");
+        lines.push("- 暂无执行步骤，等待工具调用。");
+        return lines.join("\\n");
+      }
+      lines.push("Execution");
+      lines.push("- 已完成循环: " + actions.length + "（仅展示最新）");
+      lines.push("");
+      const sessionTargetMap = buildSessionTargetMap(actions);
+      const idx = actions.length - 1;
+      const a = actions[idx];
+      const args = expandJsonLike(a.args_raw !== undefined ? a.args_raw : {});
+      let target = resolveActionTarget(a, args, sessionTargetMap);
+      target = decorateTarget(target, a, args);
+      const action = inferActionText(a.name, args);
+      const intent = buildExecutionIntent(a, args, target, action);
+      lines.push("循环 " + (idx + 1) + " / step " + (a.index || (idx + 1)));
+      lines.push("- 思路: " + intent.thought);
+      lines.push("- 计划: " + intent.plan);
+      lines.push("- 执行: [" + action + "] @ " + target);
+      lines.push("- 结论: " + summarizeStepResult(a));
+      lines.push("");
+      return lines.join("\\n");
+    }
+    function buildExecutionIntent(a, args, target, action){
+      const name = String((a && a.name) || "");
+      const cmd = String((args && args.command) || "").toLowerCase();
+      const dest = String((args && args.target) || "").trim();
+      const source = String((args && args.source) || "").trim();
+      const infoType = String((args && args.info_type) || "").trim();
+      const configType = String((args && args.config_type) || "").trim();
+      const where = (target && target !== "unknown") ? target : "目标设备";
+      const atWhere = "在 " + where;
+      if(name === "device_ping"){
+        const dst = dest || "目标地址";
+        const srcText = source ? ("，源地址/接口 " + source) : "";
+        return {
+          thought: atWhere + " 准备验证到 " + dst + " 的连通性，收集可达性、时延、丢包证据。",
+          plan: atWhere + " 执行 ping " + dst + srcText + "，记录成功率与时延。"
+        };
+      }
+      if(name === "device_traceroute"){
+        const dst = dest || "目标地址";
+        return {
+          thought: atWhere + " 准备定位到 " + dst + " 的中断点，收集逐跳路径证据。",
+          plan: atWhere + " 执行 traceroute " + dst + "，记录各 hop 的可达情况。"
+        };
+      }
+      if(name === "device_get_info"){
+        const t = infoType.toLowerCase();
+        if(t === "routing"){
+          return {
+            thought: atWhere + " 准备检查 routing 信息，收集目标前缀、下一跳、协议来源证据。",
+            plan: atWhere + " 读取 routing，确认目标网段是否存在、下一跳是否正确。"
+          };
+        }
+        if(t === "interfaces"){
+          return {
+            thought: atWhere + " 准备检查 interfaces 信息，收集端口 up/down 与错误计数证据。",
+            plan: atWhere + " 读取 interfaces，确认关键端口状态与异常计数。"
+          };
+        }
+        if(t === "arp"){
+          return {
+            thought: atWhere + " 准备验证二层可达性，收集 ARP 解析完整性证据。",
+            plan: atWhere + " 读取 ARP 表，确认目标邻居是否可解析。"
+          };
+        }
+        return {
+          thought: atWhere + " 准备读取 " + (infoType || "设备") + " 信息，收集排障证据。",
+          plan: atWhere + " 读取 " + (infoType || "通用") + " 信息并提取异常点。"
+        };
+      }
+      if(name === "device_get_config"){
+        return {
+          thought: atWhere + " 准备读取 " + (configType || "running") + " 配置，收集配置一致性证据。",
+          plan: atWhere + " 读取 " + (configType || "running") + " 配置，核对关键路由/接口配置。"
+        };
+      }
+      if(name === "device_connect"){
+        return {
+          thought: "准备接入设备 " + where + "，收集设备身份、会话可用性与设备模式信息。",
+          plan: "连接 " + where + "，确认 session_id 与 hostname。"
+        };
+      }
+      if(name === "device_disconnect"){
+        return {
+          thought: "准备处理设备 " + where + " 的会话状态，收集复用/释放结果。",
+          plan: "处理 " + where + " 会话关闭或保留策略，确保后续步骤可继续。"
+        };
+      }
+      if(name === "device_execute"){
+        if(cmd.includes("show ip route")){
+          return {
+            thought: atWhere + " 准备核对路由表，收集目标前缀与下一跳证据。",
+            plan: atWhere + " 执行 " + action + "，确认目标前缀是否在路由表中。"
+          };
+        }
+        if(cmd.includes("ospf neighbor") || cmd.includes("ospf database") || cmd.includes("ip ospf")){
+          return {
+            thought: atWhere + " 准备检查 OSPF 状态，收集邻接与 LSDB 证据。",
+            plan: atWhere + " 执行 " + action + "，确认邻居状态与路由发布是否正常。"
+          };
+        }
+        if(cmd.includes("show interface")){
+          return {
+            thought: atWhere + " 准备检查接口链路质量，收集端口状态与错误统计证据。",
+            plan: atWhere + " 执行 " + action + "，确认关键接口是否 down 或存在丢包。"
+          };
+        }
+        return {
+          thought: atWhere + " 准备执行定向诊断命令，收集与故障点相关证据。",
+          plan: atWhere + " 执行 " + action + " 并提取关键结果。"
+        };
+      }
+      return {
+        thought: atWhere + " 准备执行下一步排障动作，收集可证明故障位置的证据。",
+        plan: atWhere + " 执行 " + action + " 并记录结果用于下一轮判断。"
+      };
+    }
+    function summarizeStepResult(a){
+      if(a.ok === true){ return "成功"; }
+      if(a.ok === false){
+        const raw = String(a.result_summary || "").trim();
+        if(!raw){ return "失败"; }
+        const reason = simplifyFailureReason(raw);
+        return reason ? ("失败: " + reason) : "失败";
+      }
+      return "进行中";
+    }
+    function simplifyFailureReason(raw){
+      const s = String(raw || "");
+      if(!s){ return ""; }
+      const patterns = [
+        /会话\\s+[^\\s，。]+?\\s+不存在/,
+        /session\\s+[^\\s,.;]+?\\s+not\\s+found/i,
+        /connect\\s+failed/i,
+        /timeout/i,
+        /认证失败|authentication/i,
+        /not in table/i
+      ];
+      for(let i=0;i<patterns.length;i++){
+        const m = s.match(patterns[i]);
+        if(m && m[0]){ return m[0].slice(0, 28); }
+      }
+      return s.replace(/\\s+/g, " ").slice(0, 28);
+    }
+    function decorateTarget(target, a, args){
+      let out = String(target || "unknown");
+      if(a && a.name === "device_connect" && a.result_raw && typeof a.result_raw === 'object'){
+        const host = String(args && args.host ? args.host : "").trim();
+        const port = String(args && args.port ? args.port : "").trim();
+        const proto = String(args && args.protocol ? args.protocol : "telnet").trim();
+        const hostname = findHostnameInResult(a.result_raw);
+        if(hostname){
+          out = hostname + (host ? (" (" + host + (port ? ":" + port : "") + "/" + proto + ")") : "");
+        }else if(host){
+          out = host + (port ? ":" + port : "") + "/" + proto;
+        }
+      }
+      return out;
+    }
+    function findHostnameInResult(v){
+      if(!v){ return ""; }
+      if(typeof v === 'object'){
+        if(v.hostname && typeof v.hostname === 'string'){ return v.hostname; }
+        for(const k in v){
+          const found = findHostnameInResult(v[k]);
+          if(found){ return found; }
+        }
+      }else if(typeof v === 'string'){
+        const m = v.match(/"hostname"\\s*:\\s*"([^"]+)"/i);
+        if(m && m[1]){ return m[1]; }
+      }
+      return "";
+    }
+    function updateOpsPanels(data){
+      if(data && data.answer){ latestAnswer = data.answer; }
+      if(data && data.trace){ latestTrace = data.trace; }
+      if(latestTrace){
+        tracePreview.textContent = renderThinkingTrace(latestTrace);
+        tracePreview.scrollTop = tracePreview.scrollHeight;
+        logDetails.textContent = renderLog(latestTrace);
+        logDetails.scrollTop = logDetails.scrollHeight;
+      }else if(data && data.tool_calls && data.tool_calls.length){
+        const raw = JSON.stringify(data.tool_calls, null, 2);
+        tracePreview.textContent = "AI 思考循环\\n\\n- 思路: 暂无结构化 trace，回退到工具调用日志。";
+        logDetails.textContent = raw;
+        logDetails.scrollTop = logDetails.scrollHeight;
+      }else{
+        tracePreview.textContent = "暂无思路轨迹。";
+        logDetails.textContent = "本轮未产生工具调用。";
+      }
+      cmdPreview.textContent = buildCommandDraft(latestTrace);
+      reportPreview.textContent = buildReport(latestAnswer, latestTrace);
+    }
+    function buildCommandDraft(trace){
+      if(!trace || !Array.isArray(trace.actions) || trace.actions.length === 0){
+        return "暂无命令建议（等待设备交互产生）。";
+      }
+      const lines = ["# Command Draft (auto-generated)"];
+      const sessionTargetMap = buildSessionTargetMap(trace.actions);
+      trace.actions.forEach((a, idx) => {
+        const args = expandJsonLike(a.args_raw !== undefined ? a.args_raw : {});
+        let target = resolveActionTarget(a, args, sessionTargetMap);
+        target = decorateTarget(target, a, args);
+        const action = inferActionText(a.name, args);
+        lines.push((idx + 1) + ". [" + action + "] @ " + target);
+      });
+      return lines.join("\\n");
+    }
+    function buildSessionTargetMap(actions){
+      const map = {};
+      (actions || []).forEach((a) => {
+        const args = expandJsonLike(a.args_raw !== undefined ? a.args_raw : {});
+        let target = String((a && a.target) || inferActionTarget(args) || "").trim();
+        target = decorateTarget(target, a, args);
+        const sids = [];
+        if(args && typeof args === 'object' && args.session_id){
+          sids.push(String(args.session_id).trim());
+        }
+        extractSessionIds(a && a.result_raw).forEach((x) => sids.push(x));
+        sids.forEach((sid) => {
+          const key = String(sid || "").trim();
+          if(!key){ return; }
+          if(target && !target.startsWith("session:") && target !== "unknown"){
+            map[key] = target;
+          }
+        });
+      });
+      return map;
+    }
+    function extractSessionIds(v){
+      const out = [];
+      const push = (x) => {
+        const s = String(x || "").trim();
+        if(!s){ return; }
+        if(!out.includes(s)){ out.push(s); }
+      };
+      const walk = (node) => {
+        if(!node){ return; }
+        if(typeof node === 'string'){
+          const re = /["']?session_id["']?\\s*[:=]\\s*["']?([a-zA-Z0-9_-]+)["']?/ig;
+          let m;
+          while((m = re.exec(node)) !== null){
+            if(m[1]){ push(m[1]); }
+          }
+          return;
+        }
+        if(Array.isArray(node)){
+          node.forEach(walk);
+          return;
+        }
+        if(typeof node === 'object'){
+          if(node.session_id){ push(node.session_id); }
+          Object.keys(node).forEach((k) => walk(node[k]));
+        }
+      };
+      walk(v);
+      return out;
+    }
+    function resolveActionTarget(a, args, sessionTargetMap){
+      let target = String((a && a.target) || inferActionTarget(args) || "unknown").trim();
+      if(target.startsWith("session:")){
+        const sid = target.slice("session:".length);
+        if(sessionTargetMap[sid]){
+          target = sessionTargetMap[sid];
+        }
+      }
+      if(args && typeof args === 'object' && args.session_id){
+        const sid2 = String(args.session_id).trim();
+        if(sid2 && sessionTargetMap[sid2]){
+          target = sessionTargetMap[sid2];
+        }
+      }
+      if((!target || target === "unknown" || target.startsWith("session:")) && a && a.result_raw){
+        const sids = extractSessionIds(a.result_raw);
+        for(let i=0; i<sids.length; i++){
+          if(sessionTargetMap[sids[i]]){
+            target = sessionTargetMap[sids[i]];
+            break;
+          }
+        }
+      }
+      return target;
+    }
+    function inferActionText(name, args){
+      if(args && typeof args === 'object' && args.command){ return String(args.command); }
+      if(name === "device_ping" && args.target){ return "ping " + args.target; }
+      if(name === "device_traceroute" && args.target){ return "traceroute " + args.target; }
+      if(name === "device_get_info" && args.info_type){ return "show info " + args.info_type; }
+      if(name === "device_get_config" && args.config_type){ return "get config " + args.config_type; }
+      if(name === "device_connect"){ return "device_connect"; }
+      if(name === "device_disconnect"){ return "device_disconnect"; }
+      return String(name || "unknown_action");
+    }
+    function inferActionTarget(args){
+      if(!args || typeof args !== 'object'){ return ""; }
+      if(args.host){
+        const proto = args.protocol || "telnet";
+        if(args.port){ return String(args.host) + ":" + String(args.port) + "/" + String(proto); }
+        return String(args.host) + "/" + String(proto);
+      }
+      if(args.session_id){ return "session:" + String(args.session_id); }
+      return "";
+    }
+    function buildReport(answer, trace){
+      const p = (trace && trace.progress) ? trace.progress : {};
+      return [
+        "## Incident Report (Draft)",
+        "状态: " + ((trace && trace.status) || "unknown"),
+        "阶段: " + ((trace && trace.stage) || "unknown"),
+        "总行动: " + ((p.total_actions === undefined || p.total_actions === null) ? 0 : p.total_actions),
+        "成功: " + ((p.success_actions === undefined || p.success_actions === null) ? 0 : p.success_actions),
+        "失败: " + ((p.failed_actions === undefined || p.failed_actions === null) ? 0 : p.failed_actions),
+        "",
+        "诊断摘要:",
+        (answer || "暂无"),
+      ].join("\\n");
+    }
+    function switchRightTab(tab){
+      [tabTrace, tabLog, tabCmd, tabReport].forEach(x => x.classList.remove('active'));
+      [paneTrace, paneLog, paneCmd, paneReport].forEach(x => x.classList.remove('active'));
+      if(tab === 'trace'){ tabTrace.classList.add('active'); paneTrace.classList.add('active'); }
+      if(tab === 'log'){ tabLog.classList.add('active'); paneLog.classList.add('active'); }
+      if(tab === 'cmd'){ tabCmd.classList.add('active'); paneCmd.classList.add('active'); }
+      if(tab === 'report'){ tabReport.classList.add('active'); paneReport.classList.add('active'); }
+    }
+    function copyCommands(){
+      const text = cmdPreview.textContent || "";
+      if(!text){ return; }
+      navigator.clipboard.writeText(text);
     }
     function prettyJson(v){
       try{
@@ -385,7 +831,7 @@ HTML = """<!doctype html>
         return;
       }
       topologyJson.value = data.topology_text || "";
-      addMsg('assistant', "拓扑解析完成，请确认/编辑左侧拓扑描述后继续排障。");
+      addMsg('assistant', "拓扑分析完成，结果已自动注入后续对话上下文。");
     }
     refreshStatus();
     setInterval(refreshStatus, 10000);
@@ -406,17 +852,13 @@ def render_html() -> str:
         key_cls = "warn"
         key_text = "API Key 未配置"
 
-    provider = API_KEY_STATUS.get("provider", "unknown")
+    text_provider = API_KEY_STATUS.get("text_provider", "unknown")
+    vision_provider = API_KEY_STATUS.get("vision_provider", "unknown")
     text_model = API_KEY_STATUS.get("text_model", "unknown")
     text_source = API_KEY_STATUS.get("text_source", "unknown")
     vision_model = API_KEY_STATUS.get("vision_model", "unknown")
-    fallback = API_KEY_STATUS.get("vision_fallback_model", "") or "none"
     vision_state = "可用" if API_KEY_STATUS.get("vision_usable") else "不可用"
-    img_cap = "是" if API_KEY_STATUS.get("supports_image") else "否"
-    model_text = (
-        f"Provider: {provider} | 文本模型: {text_model} ({text_source}) | 视觉模型: {vision_model} | "
-        f"回退模型: {fallback} | 视觉状态: {vision_state} | 图片支持: {img_cap}"
-    )
+    model_text = f"🟢 文本({text_provider}): {text_model} ({text_source}) | 视觉({vision_provider}): {vision_model} ({vision_state})"
 
     return (
         HTML.replace("__KEY_STATUS_CLASS__", key_cls)
@@ -485,8 +927,8 @@ class Handler(BaseHTTPRequestHandler):
             if not image_data_url:
                 self._send_json(400, {"error": "image_data_url 不能为空"}, sid)
                 return
-            if not API_KEY_STATUS.get("usable"):
-                self._send_json(400, {"error": f"API Key 不可用: {API_KEY_STATUS.get('message', '未知错误')}"}, sid)
+            if not API_KEY_STATUS.get("vision_usable"):
+                self._send_json(400, {"error": f"视觉模型不可用: {API_KEY_STATUS.get('message', '未知错误')}"}, sid)
                 return
             try:
                 if vision_prompt:
@@ -544,22 +986,16 @@ class Handler(BaseHTTPRequestHandler):
 
         agent = AGENTS.get(sid)
         if agent is None:
-            if not DEFAULT_API_KEY:
-                if DEFAULT_PROVIDER == "zhipu":
-                    required = "ZHIPU_API_KEY"
-                elif DEFAULT_PROVIDER == "ppio":
-                    required = "PPIO_API_KEY"
-                else:
-                    required = "OPENAI_API_KEY"
-                self._send_json(400, {"error": f".env 未配置 {required}"}, sid)
+            if not DEFAULT_TEXT_API_KEY:
+                self._send_json(400, {"error": ".env 未配置 ZHIPU_API_KEY（文本模型）"}, sid)
                 return
             if not API_KEY_STATUS.get("usable"):
-                self._send_json(400, {"error": f"API Key 不可用: {API_KEY_STATUS.get('message', '未知错误')}"}, sid)
+                self._send_json(400, {"error": f"文本模型不可用: {API_KEY_STATUS.get('message', '未知错误')}"}, sid)
                 return
             agent = NetOpsAgent(
-                api_key=DEFAULT_API_KEY,
-                provider=DEFAULT_PROVIDER,
-                base_url=DEFAULT_BASE_URL,
+                api_key=DEFAULT_TEXT_API_KEY,
+                provider=DEFAULT_TEXT_PROVIDER,
+                base_url=DEFAULT_TEXT_BASE_URL,
                 model=DEFAULT_TEXT_MODEL or None,
                 auto_select_model=AUTO_SELECT_TEXT_MODEL,
             )
@@ -634,24 +1070,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global DEFAULT_API_KEY, DEFAULT_PROVIDER, DEFAULT_BASE_URL, DEFAULT_TEXT_MODEL, DEFAULT_VISION_MODEL, DEFAULT_VISION_FALLBACK_MODEL, AUTO_SELECT_TEXT_MODEL
+    global DEFAULT_TEXT_API_KEY, DEFAULT_TEXT_PROVIDER, DEFAULT_TEXT_BASE_URL
+    global DEFAULT_VISION_API_KEY, DEFAULT_VISION_PROVIDER, DEFAULT_VISION_BASE_URL
+    global DEFAULT_TEXT_MODEL, DEFAULT_VISION_MODEL, DEFAULT_VISION_FALLBACK_MODEL, AUTO_SELECT_TEXT_MODEL
     load_dotenv()
-    DEFAULT_PROVIDER = os.getenv("AI_PROVIDER", "zhipu").strip().lower() or "zhipu"
-    DEFAULT_BASE_URL = os.getenv("AI_BASE_URL", "").strip() or (
-        "https://open.bigmodel.cn/api/paas/v4/"
-        if DEFAULT_PROVIDER == "zhipu"
-        else ("https://api.ppio.com/openai" if DEFAULT_PROVIDER == "ppio" else "")
-    )
-    DEFAULT_TEXT_MODEL = os.getenv("AI_TEXT_MODEL", "").strip() or os.getenv("AI_MODEL", "").strip() or "glm-4.7"
-    DEFAULT_VISION_MODEL = os.getenv("AI_VISION_MODEL", "").strip() or "glm-4.6v"
+    DEFAULT_TEXT_PROVIDER = "zhipu"
+    DEFAULT_TEXT_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+    DEFAULT_VISION_PROVIDER = "ppio"
+    DEFAULT_VISION_BASE_URL = os.getenv("AI_VISION_BASE_URL", "").strip() or "https://api.ppio.com/openai"
+    DEFAULT_TEXT_MODEL = "glm-4.7"
+    DEFAULT_VISION_MODEL = os.getenv("AI_VISION_MODEL", "").strip() or "qwen/qwen3-vl-235b-a22b-thinking"
     DEFAULT_VISION_FALLBACK_MODEL = os.getenv("AI_VISION_FALLBACK_MODEL", "").strip()
     AUTO_SELECT_TEXT_MODEL = os.getenv("AUTO_SELECT_TEXT_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
-    if DEFAULT_PROVIDER == "zhipu":
-        DEFAULT_API_KEY = os.getenv("ZHIPU_API_KEY", "").strip()
-    elif DEFAULT_PROVIDER == "ppio":
-        DEFAULT_API_KEY = os.getenv("PPIO_API_KEY", "").strip()
-    else:
-        DEFAULT_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+    DEFAULT_TEXT_API_KEY = os.getenv("ZHIPU_API_KEY", "").strip()
+    DEFAULT_VISION_API_KEY = os.getenv("PPIO_API_KEY", "").strip()
     probe_default_api_key()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Web UI 启动: http://{HOST}:{PORT}")
@@ -659,56 +1091,63 @@ def main() -> None:
 
 
 def probe_default_api_key() -> None:
-    API_KEY_STATUS["provider"] = DEFAULT_PROVIDER
-    API_KEY_STATUS["configured"] = bool(DEFAULT_API_KEY)
+    API_KEY_STATUS["provider"] = f"text:{DEFAULT_TEXT_PROVIDER}, vision:{DEFAULT_VISION_PROVIDER}"
+    API_KEY_STATUS["text_provider"] = DEFAULT_TEXT_PROVIDER
+    API_KEY_STATUS["vision_provider"] = DEFAULT_VISION_PROVIDER
+    API_KEY_STATUS["configured"] = bool(DEFAULT_TEXT_API_KEY and DEFAULT_VISION_API_KEY)
     API_KEY_STATUS["usable"] = False
     API_KEY_STATUS["vision_usable"] = False
     API_KEY_STATUS["text_model"] = DEFAULT_TEXT_MODEL
     API_KEY_STATUS["vision_model"] = DEFAULT_VISION_MODEL
     API_KEY_STATUS["vision_fallback_model"] = DEFAULT_VISION_FALLBACK_MODEL
-    if not DEFAULT_API_KEY:
-        API_KEY_STATUS["message"] = "未配置 API Key"
+    if not DEFAULT_TEXT_API_KEY:
+        API_KEY_STATUS["message"] = "未配置 ZHIPU_API_KEY（文本模型）"
         API_KEY_STATUS["text_source"] = ""
         return
 
     try:
         probe_agent = NetOpsAgent(
-            api_key=DEFAULT_API_KEY,
-            provider=DEFAULT_PROVIDER,
-            base_url=DEFAULT_BASE_URL,
+            api_key=DEFAULT_TEXT_API_KEY,
+            provider=DEFAULT_TEXT_PROVIDER,
+            base_url=DEFAULT_TEXT_BASE_URL,
             model=DEFAULT_TEXT_MODEL or None,
             auto_select_model=AUTO_SELECT_TEXT_MODEL,
         )
         TEXT_MODEL_INFO.update(probe_agent.get_model_info())
-        client = OpenAI(api_key=DEFAULT_API_KEY, base_url=DEFAULT_BASE_URL) if DEFAULT_BASE_URL else OpenAI(api_key=DEFAULT_API_KEY)
-        client.chat.completions.create(
+        text_client = OpenAI(api_key=DEFAULT_TEXT_API_KEY, base_url=DEFAULT_TEXT_BASE_URL)
+        text_client.chat.completions.create(
             model=TEXT_MODEL_INFO["model"],
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=16,
         )
-        # Probe image capability using dedicated vision model.
-        test_img_url = "https://picsum.photos/96"
         vision_ok = False
-        try:
-            client.chat.completions.create(
-                model=DEFAULT_VISION_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "describe"},
-                            {"type": "image_url", "image_url": {"url": test_img_url}},
-                        ],
-                    }
-                ],
-                max_tokens=32,
-            )
-            vision_ok = True
-        except Exception:
-            vision_ok = False
+        if DEFAULT_VISION_API_KEY:
+            # Probe image capability using dedicated vision provider.
+            test_img_url = "https://picsum.photos/96"
+            try:
+                vision_client = OpenAI(api_key=DEFAULT_VISION_API_KEY, base_url=DEFAULT_VISION_BASE_URL)
+                vision_client.chat.completions.create(
+                    model=DEFAULT_VISION_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "describe"},
+                                {"type": "image_url", "image_url": {"url": test_img_url}},
+                            ],
+                        }
+                    ],
+                    max_tokens=32,
+                )
+                vision_ok = True
+            except Exception:
+                vision_ok = False
 
         API_KEY_STATUS["usable"] = True
-        API_KEY_STATUS["message"] = "OK"
+        if DEFAULT_VISION_API_KEY:
+            API_KEY_STATUS["message"] = "OK"
+        else:
+            API_KEY_STATUS["message"] = "文本模型可用，未配置 PPIO_API_KEY（视觉模型）"
         API_KEY_STATUS["text_model"] = TEXT_MODEL_INFO.get("model", DEFAULT_TEXT_MODEL)
         API_KEY_STATUS["text_source"] = TEXT_MODEL_INFO.get("source", "manual")
         API_KEY_STATUS["vision_model"] = DEFAULT_VISION_MODEL
@@ -726,12 +1165,12 @@ def probe_default_api_key() -> None:
 
 
 def extract_topology_from_image(*, image_data_url: str, vision_prompt: str | None = None) -> str:
-    if not DEFAULT_API_KEY:
-        raise RuntimeError("未配置 API Key")
+    if not DEFAULT_VISION_API_KEY:
+        raise RuntimeError("未配置 PPIO_API_KEY（视觉模型）")
     vision_url = normalize_image_for_vision(image_data_url)
     validate_image_url_for_vision(vision_url)
 
-    client = OpenAI(api_key=DEFAULT_API_KEY, base_url=DEFAULT_BASE_URL) if DEFAULT_BASE_URL else OpenAI(api_key=DEFAULT_API_KEY)
+    client = OpenAI(api_key=DEFAULT_VISION_API_KEY, base_url=DEFAULT_VISION_BASE_URL)
     prompt = (vision_prompt or "").strip() or DEFAULT_VISION_PROMPT_TEXT
     text = run_vision_extract(
         client=client,
@@ -1080,10 +1519,12 @@ def on_trace_event(sid: str, event: str, payload: dict) -> None:
             progress["total_actions"] = idx
             progress["completion"] = min(85, max(progress.get("completion", 20), 20 + idx * 8))
             safe_args = mask_sensitive(to_jsonable(payload.get("args")))
+            target = str(payload.get("target", "")).strip()
             actions.append(
                 {
                     "index": idx,
                     "name": str(payload.get("name", "")),
+                    "target": target,
                     "ok": None,
                     "args_raw": safe_args,
                     "args_summary": compact_text(safe_args, max_len=200),
@@ -1151,14 +1592,17 @@ def build_execution_trace(
             ok_count += 1
         else:
             fail_count += 1
+        call_args = to_jsonable(call.get("args"))
+        target = str(call.get("target") or infer_target_from_args(call_args))
         args_summary = compact_text(call.get("args"), max_len=200)
         result_summary = compact_text(call.get("result"), max_len=280)
         actions.append(
             {
                 "index": idx,
                 "name": str(call.get("name", "")),
+                "target": target,
                 "ok": ok,
-                "args_raw": to_jsonable(call.get("args")),
+                "args_raw": call_args,
                 "args_summary": args_summary,
                 "result_raw": to_jsonable(call.get("result")),
                 "result_summary": result_summary,
@@ -1199,6 +1643,22 @@ def compact_text(value, max_len: int = 240) -> str:
         raw = str(value)
     raw = re.sub(r"\s+", " ", raw).strip()
     return (raw[: max_len - 3] + "...") if len(raw) > max_len else raw
+
+
+def infer_target_from_args(args: Any) -> str:
+    if not isinstance(args, dict):
+        return ""
+    host = str(args.get("host", "")).strip()
+    port = str(args.get("port", "")).strip()
+    proto = str(args.get("protocol", "telnet")).strip() or "telnet"
+    if host and port:
+        return f"{host}:{port}/{proto}"
+    if host:
+        return f"{host}/{proto}"
+    sid = str(args.get("session_id", "")).strip()
+    if sid:
+        return f"session:{sid}"
+    return ""
 
 
 def infer_action_ok(call: dict) -> bool:

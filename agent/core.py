@@ -19,7 +19,7 @@ SYSTEM_PROMPT = """
 4) 这些设备通过 telnet 连接，不需要用户名和密码，直接连接即可。
 5) 优先最小必要检查：ping → show ip route → show ip ospf neighbor → show interfaces。
 6) 排障策略：先检查源设备(源IP所在路由器)，再检查目的设备(目的IP所在路由器)，最后检查中间路径。
-7) 每台设备检查完毕后必须 device_disconnect 释放会话，再连接下一台。
+7) 优先复用已建立会话：同一设备优先使用已有 session_id；仅在没有会话时再 device_connect。
 8) 工具步骤有限（最多20步），请高效使用，避免重复调用。
 
 输出格式固定：
@@ -70,6 +70,8 @@ class NetOpsAgent:
         self.mcp_command = mcp_command
         self.messages: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.last_connect_profile: Dict[str, Any] = {}
+        self.device_session_map: Dict[str, str] = {}
+        self.session_device_map: Dict[str, str] = {}
         self.model_info = self._resolve_model(model=model, auto_select_model=auto_select_model)
         self.model = self.model_info.model
 
@@ -127,13 +129,83 @@ class NetOpsAgent:
                         for call in tool_calls:
                             tool_name = call.function.name
                             args = self._parse_json_args(call.function.arguments)
-                            if active_session_id and tool_name not in NO_SESSION_TOOLS:
-                                args.setdefault("session_id", active_session_id)
+                            action_target = ""
+                            if tool_name == "device_connect":
+                                action_target = self._device_target_from_connect_args(args)
+                                existing_sid = self._get_reusable_session(args)
+                                if existing_sid:
+                                    active_session_id = existing_sid
+                                    result = {"session_id": existing_sid, "reused": True, "target": action_target}
+                                    tool_history.append(
+                                        {
+                                            "name": tool_name,
+                                            "args": args,
+                                            "ok": True,
+                                            "result": result,
+                                            "target": action_target,
+                                        }
+                                    )
+                                    self._emit_trace(
+                                        trace_hook,
+                                        "tool_start",
+                                        {"name": tool_name, "args": self._to_jsonable(args), "target": action_target},
+                                    )
+                                    self._emit_trace(
+                                        trace_hook,
+                                        "tool_result",
+                                        {"name": tool_name, "ok": True, "result": self._to_jsonable(result), "target": action_target},
+                                    )
+                                    self.messages.append(
+                                        {
+                                            "role": "tool",
+                                            "tool_call_id": call.id,
+                                            "content": json.dumps(result, ensure_ascii=False),
+                                        }
+                                    )
+                                    continue
+                            elif tool_name == "device_disconnect":
+                                action_target = self._target_from_session_id(args.get("session_id") or active_session_id)
+                                kept = {"skipped": True, "reason": "session_kept_for_reuse", "target": action_target}
+                                tool_history.append(
+                                    {
+                                        "name": tool_name,
+                                        "args": args,
+                                        "ok": True,
+                                        "result": kept,
+                                        "target": action_target,
+                                    }
+                                )
+                                self._emit_trace(
+                                    trace_hook,
+                                    "tool_start",
+                                    {"name": tool_name, "args": self._to_jsonable(args), "target": action_target},
+                                )
+                                self._emit_trace(
+                                    trace_hook,
+                                    "tool_result",
+                                    {"name": tool_name, "ok": True, "result": self._to_jsonable(kept), "target": action_target},
+                                )
+                                self.messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": call.id,
+                                        "content": json.dumps(kept, ensure_ascii=False),
+                                    }
+                                )
+                                continue
+                            else:
+                                if active_session_id and tool_name not in NO_SESSION_TOOLS:
+                                    # Some model outputs include empty session_id (""), normalize to active session.
+                                    if not args.get("session_id"):
+                                        args["session_id"] = active_session_id
+                                action_target = self._target_from_session_id(
+                                    args.get("session_id") or active_session_id
+                                ) or action_target
 
                             self._emit_trace(
                                 trace_hook,
                                 "tool_start",
-                                {"name": tool_name, "args": self._to_jsonable(args)},
+                                {"name": tool_name, "args": self._to_jsonable(args), "target": action_target},
                             )
                             result, err = await self._safe_call_tool(session, tool_name, args)
                             tool_history.append(
@@ -142,6 +214,7 @@ class NetOpsAgent:
                                     "args": args,
                                     "ok": err is None,
                                     "result": result if err is None else {"error": err},
+                                    "target": action_target,
                                 }
                             )
                             self._emit_trace(
@@ -151,6 +224,7 @@ class NetOpsAgent:
                                     "name": tool_name,
                                     "ok": err is None,
                                     "result": self._to_jsonable(result if err is None else {"error": err}),
+                                    "target": action_target,
                                 },
                             )
 
@@ -158,13 +232,12 @@ class NetOpsAgent:
                                 sid = result.get("session_id")
                                 if sid:
                                     active_session_id = str(sid)
+                                    self._remember_session(args, active_session_id)
                                 self.last_connect_profile = {
                                     k: v
                                     for k, v in args.items()
                                     if k in {"protocol", "port", "username", "password", "enable_password", "device_type"}
                                 }
-                            if tool_name == "device_disconnect":
-                                active_session_id = None
 
                             payload: Any = result if err is None else {"error": err}
                             if tool_name == "device_traceroute" and err is None:
@@ -198,8 +271,7 @@ class NetOpsAgent:
                             "- 下一步检查：show interface / show ip route / show arp"
                         )
 
-                    if active_session_id:
-                        await self._safe_call_tool(session, "device_disconnect", {"session_id": active_session_id})
+                    # Keep sessions for reuse across turns.
 
             self._emit_trace(trace_hook, "stage", {"name": "汇总结论", "detail": "正在基于证据生成诊断结论。"})
             confidence, evidence = self._score_confidence(tool_history, auto_hop_report)
@@ -282,6 +354,39 @@ class NetOpsAgent:
             )
 
         return report
+
+    def _device_target_from_connect_args(self, args: Dict[str, Any]) -> str:
+        host = str(args.get("host", "")).strip()
+        port = str(args.get("port", "")).strip()
+        proto = str(args.get("protocol", "telnet")).strip() or "telnet"
+        if host and port:
+            return f"{host}:{port}/{proto}"
+        if host:
+            return f"{host}/{proto}"
+        return "unknown-device"
+
+    def _device_key_from_connect_args(self, args: Dict[str, Any]) -> str:
+        host = str(args.get("host", "")).strip()
+        port = str(args.get("port", "")).strip()
+        proto = str(args.get("protocol", "telnet")).strip() or "telnet"
+        dtype = str(args.get("device_type", "auto")).strip() or "auto"
+        return f"{host}|{port}|{proto}|{dtype}".lower()
+
+    def _get_reusable_session(self, args: Dict[str, Any]) -> Optional[str]:
+        key = self._device_key_from_connect_args(args)
+        sid = self.device_session_map.get(key)
+        return str(sid) if sid else None
+
+    def _remember_session(self, args: Dict[str, Any], sid: str) -> None:
+        key = self._device_key_from_connect_args(args)
+        target = self._device_target_from_connect_args(args)
+        self.device_session_map[key] = sid
+        self.session_device_map[sid] = target
+
+    def _target_from_session_id(self, sid: Any) -> str:
+        if sid is None:
+            return ""
+        return self.session_device_map.get(str(sid), f"session:{sid}")
 
     async def _safe_call_tool(self, session: ClientSession, tool_name: str, args: Dict[str, Any]) -> Tuple[Any, Optional[str]]:
         try:
