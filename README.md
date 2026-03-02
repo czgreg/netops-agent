@@ -1,4 +1,4 @@
-# ab-agent
+# netops-agent
 
 一个面向网络排障场景的智能 Agent 项目，包含：
 - `agent/`：排障 Agent 核心逻辑（推理、工具调用、状态管理）
@@ -10,7 +10,7 @@
 ## 项目结构
 
 ```text
-ab-agent/
+netops-agent/
 ├── agent/                  # Agent核心代码
 ├── scripts/                # 辅助脚本（启动、测试）
 ├── web_ui.py               # Web UI入口

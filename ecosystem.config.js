@@ -1,9 +1,9 @@
 module.exports = {
   apps: [
     {
-      name: "netops-web-ui",
+      name: "netops-agent",
       script: "./scripts/start_web_with_open.sh",
-      cwd: "/Users/chengzhe/Desktop/ab-agent",
+      cwd: __dirname,
       interpreter: "bash",
       autorestart: true,
       watch: false,
@@ -19,4 +19,3 @@ module.exports = {
     },
   ],
 };
-

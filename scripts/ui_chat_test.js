@@ -1,4 +1,5 @@
 const { chromium } = require('playwright');
+const path = require('path');
 
 (async () => {
   const browser = await chromium.launch({ headless: true });
@@ -31,7 +32,8 @@ const { chromium } = require('playwright');
   const status = await page.$eval('#keyStatus', n => n.textContent || '');
   const modelInfo = await page.$eval('#modelInfo', n => n.textContent || '');
 
-  await page.screenshot({ path: '/Users/chengzhe/Desktop/ab-agent/logs/ui-chat-test.png', fullPage: true });
+  const screenshotPath = path.resolve(__dirname, '../logs/ui-chat-test.png');
+  await page.screenshot({ path: screenshotPath, fullPage: true });
   console.log(JSON.stringify({ gotAssistant, status, modelInfo, messages: messages.slice(-8), details: details.slice(0, 1400) }, null, 2));
 
   await browser.close();
