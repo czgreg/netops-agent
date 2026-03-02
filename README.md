@@ -4,7 +4,7 @@
 - `agent/`：排障 Agent 核心逻辑（推理、工具调用、状态管理）
 - `web_ui.py`：本地 Web 交互界面（拓扑解析 + 对话排障 + Trace/Log/Commands/Report）
 - `agent_chat.py`：命令行对话入口
-- `netpilot-mcp/`：网络设备 MCP 服务（Telnet/SSH、跨厂商驱动、结构化输出）
+- `netpilot-mcp`：网络设备 MCP 服务（需在线安装，不从本地启动），项目地址：[netpilot-mcp](https://github.com/czgreg/netpilot-mcp)
 - `scripts/`：启动与 UI 测试脚本
 
 ## 项目结构
@@ -12,7 +12,6 @@
 ```text
 ab-agent/
 ├── agent/                  # Agent核心代码
-├── netpilot-mcp/           # MCP工具服务（设备连接/执行命令/诊断）
 ├── scripts/                # 辅助脚本（启动、测试）
 ├── web_ui.py               # Web UI入口
 ├── agent_chat.py           # CLI入口
@@ -41,7 +40,7 @@ bash scripts/quick_start.sh
 
 这个脚本会自动完成：
 - 创建并使用 `.venv` 虚拟环境
-- 安装依赖（`netpilot-mcp` + `openai`）
+- 安装依赖（包括在线安装 `netpilot-mcp`）
 - 若没有 `.env`，自动从 `.env.example` 生成
 - 检查 API Key 是否为空并给出提示
 - 启动 Web UI（默认 `http://127.0.0.1:8787`）
